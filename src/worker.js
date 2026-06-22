@@ -480,24 +480,39 @@ async function sendStructuredMail (env, { subject, text, html, replyTo, cc, bcc 
     log('warn', 'mail:send-rpc-failed-falling-back', { error: msg })
   }
 
-  // Fallback: ExternalServer-shaped binding. POST the same payload.
-  const candidates = ['https://internal/send', 'https://internal/']
+  // Fallback: ExternalServer-shaped binding. We don't know the
+  // exact path/method the bigrandall shim expects, so probe a few
+  // common shapes. The first prior attempt told us:
+  //    POST /send → 405 method not allowed (path exists, method wrong)
+  //    POST /     → 404 not found
+  // Try other methods on /send + other common email-API paths.
+  const candidates = [
+    { url: 'https://internal/send', method: 'PUT' },
+    { url: 'https://internal/send', method: 'GET' },
+    { url: 'https://internal/send', method: 'PATCH' },
+    { url: 'https://internal/v1/send', method: 'POST' },
+    { url: 'https://internal/email/send', method: 'POST' },
+    { url: 'https://internal/messages', method: 'POST' },
+    { url: 'https://internal/email', method: 'POST' },
+    { url: 'https://internal/mail/send', method: 'POST' },
+    { url: 'https://internal/api/send', method: 'POST' },
+    { url: 'https://internal/__send', method: 'POST' }
+  ]
   const errors = []
-  for (const url of candidates) {
+  for (const { url, method } of candidates) {
     try {
-      const res = await env.SEND_EMAIL.fetch(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload)
-      })
+      const init = { method, headers: { 'content-type': 'application/json' } }
+      if (method !== 'GET' && method !== 'HEAD') init.body = JSON.stringify(payload)
+      const res = await env.SEND_EMAIL.fetch(url, init)
       const body = await res.text().catch(() => '')
+      const label = `${method} ${url.replace('https://internal', '')}`
       if (res.ok) {
-        log('info', 'mail:sent', { via: 'fetch', url, status: res.status })
+        log('info', 'mail:sent', { via: 'fetch', tried: label, status: res.status })
         return
       }
-      errors.push(`${url} → ${res.status} ${body.slice(0, 160)}`)
+      errors.push(`${label} → ${res.status} ${body.slice(0, 100)}`)
     } catch (e) {
-      errors.push(`${url} → ${e?.message || e}`)
+      errors.push(`${method} ${url} → ${e?.message || e}`)
     }
   }
   throw new Error('mail: ExternalServer fetch fallback exhausted: ' + errors.join(' | '))

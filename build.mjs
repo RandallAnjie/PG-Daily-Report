@@ -142,6 +142,12 @@ await build({
       'globalThis.Buffer = __M_buffer.Buffer;' +
       'globalThis.process = globalThis.process || ' +
         '{ env: {}, platform: "linux", versions: { node: "22.0.0" } };' +
+      // Node exposes `global` as an alias for the global object;
+      // workerd only ships `globalThis`. pg's Client constructor
+      // touches `global` directly, throwing ReferenceError as
+      // early as `new pg.Client(...)`. Aliasing fixes every other
+      // dep that does the same dance for free.
+      'globalThis.global = globalThis.global || globalThis;' +
       'globalThis.require = (m) => {' +
         'if (__NODE_MODS[m]) return __NODE_MODS[m];' +
         'throw new Error("Dynamic require of \\""+m+"\\" not in node-mod table");' +

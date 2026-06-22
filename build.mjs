@@ -75,6 +75,16 @@ await build({
   target: 'es2022',
   outfile: 'dist/_worker.js',
   plugins: [nodeResolvePlugin],
+  // porsager/postgres reaches for a bare global `Buffer` (without
+  // an import), counting on Node's default `globalThis.Buffer`.
+  // bigrandall's workerd doesn't expose Buffer as a global even
+  // with `nodejs_compat`, so the first PG message-frame encode
+  // throws `Buffer is not defined`. Banner-import it from
+  // node:buffer so every code path in the bundle has `Buffer` in
+  // its outer scope.
+  banner: {
+    js: 'import { Buffer } from "node:buffer"; globalThis.Buffer = Buffer;'
+  },
   minify: false,
   sourcemap: false,
   logLevel: 'info'

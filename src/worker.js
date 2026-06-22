@@ -61,6 +61,17 @@ export default {
       return runReport(env, ctx, { trigger: 'manual', expression: '' })
     }
 
+    if (url.pathname === '/admin/probe-email') {
+      // Diagnostic: try multiple SEND_EMAIL.send() signatures and
+      // report which (if any) didn't throw. Use this to figure out
+      // the binding's expected payload shape on bigrandall — the
+      // error message body usually names the field it's missing.
+      if (!isAdmin(request, env)) {
+        return new Response('unauthorized\n', { status: 401 })
+      }
+      return probeEmailShapes(env)
+    }
+
     if (url.pathname === '/admin/preview') {
       // Same DB + CSV path, but emits the CSV in the response body
       // instead of sending the email. Useful for debugging the
@@ -105,6 +116,44 @@ export default {
  * env var is empty / unset, BOTH paths fail closed — even an
  * empty `?token=` won't unlock anything.
  */
+/** Try several common SEND_EMAIL.send() argument shapes against
+ *  the bigrandall binding, capturing which one didn't throw and
+ *  what the rejection message was for the others. The point isn't
+ *  to actually deliver a mail (DKIM gates that anyway in dev) —
+ *  it's to figure out which payload shape the binding parser
+ *  expects so the real call site can stop iterating on deploys. */
+async function probeEmailShapes (env) {
+  const from = env.EMAIL_FROM || 'probe@example.com'
+  const to = env.EMAIL_TO || 'probe@example.com'
+  const subject = 'probe'
+  const text = 'probe body'
+  const shapes = [
+    ['{from,to,subject,text}', () => env.SEND_EMAIL.send({ from, to, subject, text })],
+    ['{from,to,subject,body}', () => env.SEND_EMAIL.send({ from, to, subject, body: text })],
+    ['{from,to,subject,html}', () => env.SEND_EMAIL.send({ from, to, subject, html: '<p>' + text + '</p>' })],
+    ['(from,to,subject,text) positional', () => env.SEND_EMAIL.send(from, to, subject, text)],
+    ['(to,subject,text) positional 3', () => env.SEND_EMAIL.send(to, subject, text)],
+    ['{message:{from,to,subject,text}}', () => env.SEND_EMAIL.send({ message: { from, to, subject, text } })],
+    ['{mail:{from,to,subject,text}}', () => env.SEND_EMAIL.send({ mail: { from, to, subject, text } })],
+    ['{to,from,subject,text} (to first)', () => env.SEND_EMAIL.send({ to, from, subject, text })],
+    ['{from,to,subject,raw} text-as-raw', () => env.SEND_EMAIL.send({ from, to, subject, raw: text })],
+    ['{from,to,raw} pure RFC822', () => env.SEND_EMAIL.send({ from, to, raw: 'From: ' + from + '\r\nTo: ' + to + '\r\nSubject: ' + subject + '\r\n\r\n' + text })]
+  ]
+  const results = []
+  for (const [label, fn] of shapes) {
+    try {
+      await fn()
+      results.push({ shape: label, ok: true })
+    } catch (e) {
+      results.push({ shape: label, ok: false, error: String(e?.message || e).slice(0, 200) })
+    }
+  }
+  return new Response(JSON.stringify({ results }, null, 2), {
+    status: 200,
+    headers: { 'content-type': 'application/json; charset=utf-8' }
+  })
+}
+
 function isAdmin (request, env) {
   const expected = env.ADMIN_TOKEN || ''
   if (!expected) return false

@@ -77,17 +77,27 @@ SSL is required by default on Azure PG; the worker passes
 
 ## Verifying after deploy
 
+The `/admin/*` endpoints accept either a Bearer header or a
+`?token=…` query string — pick whichever's convenient.
+
 ```bash
 # Status page (no auth needed):
-curl https://pg-daily-report-randall.edge.bigrandall.io/
+curl https://<your-worker>.edge.bigrandall.io/
 
 # Preview the CSV without sending mail (admin token gated):
-curl -X POST -H 'Authorization: Bearer <ADMIN_TOKEN>' \
-  https://pg-daily-report-randall.edge.bigrandall.io/admin/preview
+curl https://<your-worker>.edge.bigrandall.io/admin/preview \
+  -H 'Authorization: Bearer <ADMIN_TOKEN>'
 
 # Trigger the full pipeline manually:
-curl -X POST -H 'Authorization: Bearer <ADMIN_TOKEN>' \
-  https://pg-daily-report-randall.edge.bigrandall.io/admin/run
+curl https://<your-worker>.edge.bigrandall.io/admin/run \
+  -H 'Authorization: Bearer <ADMIN_TOKEN>'
+```
+
+Or from a browser address bar (just paste — both work as GET):
+
+```
+https://<your-worker>.edge.bigrandall.io/admin/preview?token=<ADMIN_TOKEN>
+https://<your-worker>.edge.bigrandall.io/admin/run?token=<ADMIN_TOKEN>
 ```
 
 If `/admin/preview` returns CSV, the DB + query are good. If

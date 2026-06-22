@@ -78,11 +78,29 @@ export default {
   }
 }
 
+/**
+ * Two ways to authenticate an /admin/* hit, both equivalent:
+ *
+ *   1. Header — `Authorization: Bearer <ADMIN_TOKEN>`. Right
+ *      shape for curl / cron / any programmatic caller.
+ *   2. Query string — `?token=<ADMIN_TOKEN>`. Lets the operator
+ *      paste a URL into a browser's address bar (GET) and trigger
+ *      the report by hand, without futzing with cookies or
+ *      DevTools to forge a header.
+ *
+ * Both compare against the same `ADMIN_TOKEN` env var. When the
+ * env var is empty / unset, BOTH paths fail closed — even an
+ * empty `?token=` won't unlock anything.
+ */
 function isAdmin (request, env) {
   const expected = env.ADMIN_TOKEN || ''
   if (!expected) return false
   const auth = request.headers.get('authorization') || ''
-  return auth === `Bearer ${expected}`
+  if (auth === `Bearer ${expected}`) return true
+  let url
+  try { url = new URL(request.url) } catch { return false }
+  const tokenParam = url.searchParams.get('token') || ''
+  return tokenParam !== '' && tokenParam === expected
 }
 
 /** Run the full report pipeline and return a JSON status string.

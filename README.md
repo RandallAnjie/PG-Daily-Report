@@ -40,8 +40,8 @@ a failure-notice email so the operator notices the silence.
 | Path | Auth | What it does |
 | --- | --- | --- |
 | `POST /__edge_cron` | none (bigrandall agent only) | Cron entry; runs the report once. |
-| `POST /admin/run` | `Authorization: Bearer <ADMIN_TOKEN>` | Same as cron, manually triggered. |
-| `POST /admin/preview` | `Authorization: Bearer <ADMIN_TOKEN>` | Runs the DB query, returns the CSV in the response body — does NOT send email. Use this to validate the query + the connection before going live. |
+| `GET\|POST /admin/run` | Bearer header **or** `?token=` | Same flow as cron, manually triggered. The `?token=` form lets you paste the URL into a browser address bar — no curl / DevTools needed. |
+| `GET\|POST /admin/preview` | Bearer header **or** `?token=` | Runs the DB query and returns the CSV in the response body — does NOT send email. Use this to validate the query + the connection before going live. |
 | anything else | none | Status page. |
 
 ## Local build

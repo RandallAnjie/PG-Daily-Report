@@ -230,10 +230,15 @@ async function buildReport (env) {
     `)
     log('info', 'pg:query-done', { rows: result.rowCount ?? result.rows.length, fields: result.fields?.length || 0, queryMs: Date.now() - queryAt })
   } finally {
-    // Close the socket so the worker doesn't leak it across cron
-    // invocations. pg's end() is idempotent and safe to call even
-    // when connect() failed (the no-op path).
-    try { await client.end() } catch {}
+    // Fire-and-forget the socket close. pg-cloudflare's
+    // CloudflareSocket.close() returns a Promise that hangs
+    // forever on workerd (we observed this — execution never
+    // returned from `await client.end()` after a successful
+    // query, dropping the request mid-pipeline with no error
+    // visible in the log tail). The socket gets garbage
+    // collected when the request scope unwinds; we don't need
+    // to wait for the OS-level shutdown to finish.
+    try { client.end().catch(() => {}) } catch {}
   }
   const queryDurationMs = Date.now() - queryStartedAt
 

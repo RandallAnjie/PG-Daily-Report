@@ -11,7 +11,8 @@
   },
   "dependencies": {
     "esbuild": "0.24.0",
-    "postgres": "3.4.5"
+    "pg": "8.15.6",
+    "pg-cloudflare": "1.2.5"
   },
   "devDependencies": {
     "oxlint": "1.2.0"

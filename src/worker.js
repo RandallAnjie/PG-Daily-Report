@@ -20,7 +20,8 @@
 // Anything else returns a tiny status page so the deploy can be
 // poked from a browser to confirm the worker is up.
 
-import postgres from 'postgres'
+import pg from 'pg'
+import { CloudflareSocket } from 'pg-cloudflare'
 
 // Outbound mail goes through the operator-configured bigrandall
 // binding (named `SEND_EMAIL` by convention in this repo, but
@@ -29,6 +30,18 @@ import postgres from 'postgres'
 // domain. NOT the `cloudflare:email` internal module, which
 // bigrandall's workerd doesn't ship — see sendMimeMail() for the
 // plain-object invocation shape.
+//
+// On the PG side we use `pg` (node-postgres) instead of the
+// porsager `postgres` library because workerd's `node:net` on
+// bigrandall is a resolve-only stub — `net.connect()` returns
+// a Socket-shaped object whose write() instantly times out at
+// the TCP layer. `pg-cloudflare`'s `CloudflareSocket` is a
+// node-compatible Socket wrapper around `cloudflare:sockets`,
+// which IS bridged correctly. We pass it explicitly via the
+// `stream` factory option (Client's runtime check for
+// `navigator.userAgent === "Cloudflare-Workers"` won't match
+// bigrandall, so auto-detection fails and we'd fall back to
+// node:net without the manual override).
 
 export default {
   async fetch (request, env, ctx) {
@@ -155,60 +168,62 @@ function jsonStatus (payload) {
  * row since deploy day".
  */
 async function buildReport (env) {
-  const sql = openPg(env)
+  const client = openPg(env)
   const queryStartedAt = Date.now()
-  let rows
+  let result
   try {
-    rows = await sql`
-      SELECT
-        users.*,
-        auth_credentials.*
+    await client.connect()
+    result = await client.query(`
+      SELECT users.*, auth_credentials.*
       FROM "public"."users"
       LEFT JOIN auth_credentials
         ON auth_credentials.user_id = users."id"
       WHERE users."created_at" > now() - interval '24 hours'
-    `
+    `)
   } finally {
-    // sql.end({ timeout: ... }) on the porsager client closes the
-    // socket and waits up to N seconds for in-flight queries — at
-    // this point we only have one (just finished), so 2 s is
-    // generous.
-    try { await sql.end({ timeout: 2 }) } catch {}
+    // Close the socket so the worker doesn't leak it across cron
+    // invocations. pg's end() is idempotent and safe to call even
+    // when connect() failed (the no-op path).
+    try { await client.end() } catch {}
   }
   const queryDurationMs = Date.now() - queryStartedAt
 
-  const columns = rows.length > 0 ? Object.keys(rows[0]) : []
-  const csv = rowsToCsv(rows, columns)
+  // pg returns columns in the field order of the SELECT statement,
+  // matching what the SQL author would expect.
+  const columns = result.fields ? result.fields.map((f) => f.name) : []
+  const csv = rowsToCsv(result.rows, columns)
   return {
-    rowCount: rows.length,
+    rowCount: result.rows.length,
     columns,
     csv,
     durationMs: queryDurationMs
   }
 }
 
-/** Open the workerd-native Postgres client. porsager/postgres 3.x
- *  auto-detects workerd and uses `cloudflare:sockets` under the
- *  hood, so no socket-factory wiring is needed — just the standard
- *  connection options. `prepare: false` disables server-side
- *  prepared statement caching which workerd can't store across
- *  isolates anyway, and `fetch_types: false` skips an introspection
- *  round-trip the client otherwise does on first connect. */
+/** Open a one-shot node-postgres Client wired to use
+ *  `cloudflare:sockets` for the underlying TCP connection.
+ *
+ *  We pass `stream` as a factory function so pg's Connection
+ *  layer calls it lazily AT connect-time and uses the result as
+ *  its socket instead of the default `new net.Socket()`. That
+ *  avoids workerd's broken `node:net` stub entirely. `ssl: true`
+ *  enables TLS — pg will negotiate it via the helper's
+ *  `startTls()` method, which forwards to the same socket. */
 function openPg (env) {
-  return postgres({
+  return new pg.Client({
     host: env.PG_HOST,
     port: parseInt(env.PG_PORT || '5432', 10),
     database: env.PG_DATABASE,
-    username: env.PG_USER,
+    user: env.PG_USER,
     password: env.PG_PASSWORD,
-    ssl: 'require',
-    prepare: false,
-    fetch_types: false,
-    connection: {
-      // Helps the operator find this worker in pg_stat_activity
-      // when debugging slow connections / over-quota.
-      application_name: 'pg-daily-report'
-    }
+    ssl: { rejectUnauthorized: false },
+    application_name: 'pg-daily-report',
+    stream: (config) => new CloudflareSocket(config.ssl),
+    // Hard cap so a bad firewall / wrong port doesn't keep the
+    // worker invocation alive for the workerd wall-time limit.
+    connectionTimeoutMillis: 10000,
+    statement_timeout: 25000,
+    query_timeout: 25000
   })
 }
 

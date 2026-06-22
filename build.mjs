@@ -37,7 +37,26 @@ const EXTERNAL_BUILTINS = [
 const SHIMMED_BUILTINS = {
   os: path.resolve(__dirname, 'src/shims/os.js'),
   fs: path.resolve(__dirname, 'src/shims/fs.js'),
-  perf_hooks: path.resolve(__dirname, 'src/shims/perf_hooks.js')
+  perf_hooks: path.resolve(__dirname, 'src/shims/perf_hooks.js'),
+  // node-postgres' transitive `pgpass` dep wants readline to scan
+  // a ~/.pgpass file. We always pass PG_PASSWORD in env so the
+  // lookup is dead code; the pgpass module itself is shimmed at
+  // the package level (alias below), so this readline shim never
+  // executes in practice — it's just here so module resolution
+  // doesn't blow up if some other dep starts importing readline.
+  readline: path.resolve(__dirname, 'src/shims/fs.js')
+}
+
+// Some transitive deps that are useless in workerd. Resolve them
+// to a one-line shim instead of pulling them into the bundle.
+const ALIAS_MODULES = {
+  pgpass: path.resolve(__dirname, 'src/shims/pgpass.js'),
+  // `pg-native` is node-postgres' optional libpq-based C binding.
+  // Workerd can't load native add-ons. pg checks for it in a
+  // try/catch at module load time and falls back to the JS
+  // implementation when the require throws, so we point it at a
+  // shim that always throws.
+  'pg-native': path.resolve(__dirname, 'src/shims/pg-native.js')
 }
 
 const nodeResolvePlugin = {
@@ -63,6 +82,12 @@ const nodeResolvePlugin = {
 
     build.onResolve({ filter: /^cloudflare:/ }, (args) => {
       return { path: args.path, external: true }
+    })
+
+    // Alias select transitive packages to local shims (e.g. pgpass).
+    const aliasRe = new RegExp(`^(${Object.keys(ALIAS_MODULES).join('|')})$`)
+    build.onResolve({ filter: aliasRe }, (args) => {
+      return { path: ALIAS_MODULES[args.path] }
     })
   }
 }

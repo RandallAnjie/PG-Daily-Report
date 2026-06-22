@@ -1,0 +1,19 @@
+{
+  "name": "pg-daily-report",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/worker.js",
+  "license": "MIT",
+  "scripts": {
+    "build": "node build.mjs",
+    "lint": "oxlint ."
+  },
+  "dependencies": {
+    "esbuild": "0.24.0",
+    "postgres": "3.4.5"
+  },
+  "devDependencies": {
+    "oxlint": "1.2.0"
+  }
+}

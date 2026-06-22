@@ -119,30 +119,74 @@ function isAdmin (request, env) {
 /** Run the full report pipeline and return a JSON status string.
  *  Wrapped in try/catch so a single failure doesn't take the worker
  *  down — bigrandall will retry on the next cron tick anyway, and
- *  the email body itself carries diagnostics on success / failure. */
+ *  the email body itself carries diagnostics on success / failure.
+ *
+ *  Logs at every stage transition so a tail of the worker's stderr
+ *  reads like a single-line per-step audit trail. Keeps the
+ *  diagnostic noise inside the worker; the email body itself stays
+ *  the operator-facing summary. */
 async function runReport (env, ctx, meta) {
   const startedAt = Date.now()
+  log('info', 'report:start', { trigger: meta.trigger, expression: meta.expression })
+
   let report
   try {
     report = await buildReport(env)
+    log('info', 'report:built', {
+      rows: report.rowCount,
+      columns: report.columns.length,
+      csvBytes: report.csv.length,
+      queryMs: report.durationMs
+    })
   } catch (e) {
     const msg = `report build failed (${meta.trigger}): ${e?.message || e}`
-    try { console.error(msg, e?.stack) } catch {}
-    // Still attempt to send the operator a failure notice so they
-    // notice the DB is sideways — common cause is Azure firewall
-    // not whitelisting the bigrandall egress, which the operator
-    // would otherwise only notice when the daily mail stops landing.
-    try { await sendFailureMail(env, msg) } catch {}
-    return jsonStatus({ ok: false, error: msg, durationMs: Date.now() - startedAt })
+    log('error', 'report:build-failed', { error: e?.message || String(e), stack: e?.stack })
+    try { await sendFailureMail(env, msg) } catch (mailErr) {
+      log('error', 'report:failure-mail-also-failed', { error: mailErr?.message })
+    }
+    return jsonStatus({ ok: false, stage: 'build', error: msg, durationMs: Date.now() - startedAt })
   }
+
   try {
     await sendReportMail(env, report)
+    log('info', 'report:mail-sent', { to: env.EMAIL_TO })
   } catch (e) {
     const msg = `mail send failed: ${e?.message || e}`
-    try { console.error(msg, e?.stack) } catch {}
-    return jsonStatus({ ok: false, error: msg, ...report, durationMs: Date.now() - startedAt })
+    log('error', 'report:mail-failed', { error: e?.message || String(e), stack: e?.stack })
+    return jsonStatus({
+      ok: false, stage: 'mail', error: msg,
+      rowCount: report.rowCount, csvBytes: report.csv.length,
+      durationMs: Date.now() - startedAt
+    })
   }
-  return jsonStatus({ ok: true, ...report, durationMs: Date.now() - startedAt, trigger: meta.trigger })
+
+  const totalMs = Date.now() - startedAt
+  log('info', 'report:done', { trigger: meta.trigger, rows: report.rowCount, totalMs })
+  return jsonStatus({
+    ok: true,
+    rowCount: report.rowCount,
+    columns: report.columns.length,
+    csvBytes: report.csv.length,
+    queryMs: report.durationMs,
+    durationMs: totalMs,
+    trigger: meta.trigger
+  })
+}
+
+/** Single-line JSON log helper. workerd writes whatever you pass
+ *  to console.log straight to stderr; JSON keeps the lines easy
+ *  to grep + parse in the bigrandall log panel. */
+function log (level, event, fields) {
+  try {
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      level,
+      event,
+      ...(fields || {})
+    })
+    if (level === 'error' || level === 'warn') console.error(line)
+    else console.log(line)
+  } catch {}
 }
 
 function jsonStatus (payload) {
@@ -168,11 +212,15 @@ function jsonStatus (payload) {
  * row since deploy day".
  */
 async function buildReport (env) {
+  log('info', 'pg:open', { host: env.PG_HOST, port: env.PG_PORT || '5432', database: env.PG_DATABASE, user: env.PG_USER })
   const client = openPg(env)
   const queryStartedAt = Date.now()
   let result
   try {
+    log('info', 'pg:connecting')
     await client.connect()
+    log('info', 'pg:connected', { connectMs: Date.now() - queryStartedAt })
+    const queryAt = Date.now()
     result = await client.query(`
       SELECT users.*, auth_credentials.*
       FROM "public"."users"
@@ -180,6 +228,7 @@ async function buildReport (env) {
         ON auth_credentials.user_id = users."id"
       WHERE users."created_at" > now() - interval '24 hours'
     `)
+    log('info', 'pg:query-done', { rows: result.rowCount ?? result.rows.length, fields: result.fields?.length || 0, queryMs: Date.now() - queryAt })
   } finally {
     // Close the socket so the worker doesn't leak it across cron
     // invocations. pg's end() is idempotent and safe to call even
@@ -338,14 +387,24 @@ async function sendMimeMail (env, { subject, text, attachment }) {
   if (!from || !to) {
     throw new Error('EMAIL_FROM / EMAIL_TO env vars not set')
   }
-  if (!env.SEND_EMAIL || typeof env.SEND_EMAIL.send !== 'function') {
+  if (!env.SEND_EMAIL) {
     throw new Error('SEND_EMAIL binding not bound — see RANDALLFLARE.md')
   }
+  // NOTE on the missing `typeof env.SEND_EMAIL.send === "function"`
+  // guard: bigrandall's service-binding stubs are RPC-shaped, and
+  // any property access on them (even a typeof check) triggers a
+  // platform warning about "__es_marker__ might appear to be an
+  // RPC method". So we trust the binding exists and let .send()
+  // throw at call time if it doesn't — caught by runReport() above.
 
   const raw = attachment
     ? buildMultipart({ from, to, subject, text, attachment })
     : buildPlain({ from, to, subject, text })
 
+  log('info', 'mail:send', {
+    to, from, subject, rawBytes: raw.length,
+    hasAttachment: !!attachment
+  })
   await env.SEND_EMAIL.send({ from, to, raw })
 }
 

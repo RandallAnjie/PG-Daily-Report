@@ -457,7 +457,50 @@ async function sendStructuredMail (env, { subject, text, html, replyTo, cc, bcc 
     textBytes: text?.length || 0,
     htmlBytes: html?.length || 0
   })
-  await env.SEND_EMAIL.send(payload)
+
+  // Try the RPC `.send()` style first (the documented signature
+  // in bigrandall's emailSenderShimSource). If the binding is
+  // actually wired up as an `ExternalServer`-type — which only
+  // accepts `.fetch()` — workerd throws
+  //   "This ExternalServer not configured for RPC."
+  // We catch that one specific failure and degrade to a fetch-
+  // style POST against the binding. The URL host is meaningless
+  // for a worker binding (the runtime ignores it and routes to
+  // whatever the binding points at); we just need a valid Request
+  // shape with a JSON body the upstream shim can parse.
+  try {
+    await env.SEND_EMAIL.send(payload)
+    log('info', 'mail:sent', { via: 'rpc' })
+    return
+  } catch (e) {
+    const msg = String(e?.message || e)
+    if (!/ExternalServer not configured for RPC|not.*RPC/i.test(msg)) {
+      throw e
+    }
+    log('warn', 'mail:send-rpc-failed-falling-back', { error: msg })
+  }
+
+  // Fallback: ExternalServer-shaped binding. POST the same payload.
+  const candidates = ['https://internal/send', 'https://internal/']
+  const errors = []
+  for (const url of candidates) {
+    try {
+      const res = await env.SEND_EMAIL.fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+      const body = await res.text().catch(() => '')
+      if (res.ok) {
+        log('info', 'mail:sent', { via: 'fetch', url, status: res.status })
+        return
+      }
+      errors.push(`${url} → ${res.status} ${body.slice(0, 160)}`)
+    } catch (e) {
+      errors.push(`${url} → ${e?.message || e}`)
+    }
+  }
+  throw new Error('mail: ExternalServer fetch fallback exhausted: ' + errors.join(' | '))
 }
 
 /** Escape `&`, `<`, `>`, `"`, `'` so a CSV cell with a stray `<`

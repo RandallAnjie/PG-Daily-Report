@@ -487,16 +487,17 @@ async function sendStructuredMail (env, { subject, text, html, replyTo, cc, bcc 
   //    POST /     → 404 not found
   // Try other methods on /send + other common email-API paths.
   const candidates = [
+    // Probe /send with OPTIONS first — server should reply with
+    // Allow: header naming the accepted methods. We capture it
+    // below and the operator can read the response error to know
+    // which verb to keep.
+    { url: 'https://internal/send', method: 'OPTIONS' },
+    { url: 'https://internal/send', method: 'POST' },
     { url: 'https://internal/send', method: 'PUT' },
-    { url: 'https://internal/send', method: 'GET' },
     { url: 'https://internal/send', method: 'PATCH' },
-    { url: 'https://internal/v1/send', method: 'POST' },
-    { url: 'https://internal/email/send', method: 'POST' },
-    { url: 'https://internal/messages', method: 'POST' },
-    { url: 'https://internal/email', method: 'POST' },
-    { url: 'https://internal/mail/send', method: 'POST' },
-    { url: 'https://internal/api/send', method: 'POST' },
-    { url: 'https://internal/__send', method: 'POST' }
+    { url: 'https://internal/send', method: 'GET' },
+    { url: 'https://internal/send', method: 'DELETE' },
+    { url: 'https://internal/', method: 'OPTIONS' }
   ]
   const errors = []
   for (const { url, method } of candidates) {
@@ -510,7 +511,12 @@ async function sendStructuredMail (env, { subject, text, html, replyTo, cc, bcc 
         log('info', 'mail:sent', { via: 'fetch', tried: label, status: res.status })
         return
       }
-      errors.push(`${label} → ${res.status} ${body.slice(0, 100)}`)
+      // 405 carries an Allow: header naming the accepted methods.
+      // Capture it so the next probe iteration knows which verb
+      // the upstream actually wants.
+      const allow = res.headers.get('allow') || res.headers.get('Allow') || ''
+      const ct = res.headers.get('content-type') || ''
+      errors.push(`${label} → ${res.status}${allow ? ' allow=' + allow : ''}${ct ? ' ct=' + ct : ''} ${body.slice(0, 100)}`)
     } catch (e) {
       errors.push(`${method} ${url} → ${e?.message || e}`)
     }

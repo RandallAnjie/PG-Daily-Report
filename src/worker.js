@@ -21,7 +21,14 @@
 // poked from a browser to confirm the worker is up.
 
 import postgres from 'postgres'
-import { EmailMessage } from 'cloudflare:email'
+
+// Outbound mail goes through the operator-configured bigrandall
+// binding (named `SEND_EMAIL` by convention in this repo, but
+// anything works — adjust env.SEND_EMAIL in sendMimeMail() if you
+// renamed it). Gated on a green DKIM + SPF record for the sender
+// domain. NOT the `cloudflare:email` internal module, which
+// bigrandall's workerd doesn't ship — see sendMimeMail() for the
+// plain-object invocation shape.
 
 export default {
   async fetch (request, env, ctx) {
@@ -286,9 +293,12 @@ async function sendFailureMail (env, errorMessage) {
 
 /** Build an RFC-5322 / 5321 raw email (multipart/mixed when an
  *  attachment is present, plain text otherwise) and hand it to the
- *  bigrandall `SEND_EMAIL` binding. The binding API matches
- *  Cloudflare's Email Workers — `EmailMessage(from, to, raw)` then
- *  `binding.send(msg)`. */
+ *  bigrandall outbound mail binding (`SEND_EMAIL`). The binding's
+ *  invocation shape mirrors Cloudflare's Email Workers — pass an
+ *  object carrying `from`, `to`, and `raw` (the RFC-822 text). We
+ *  skip the `cloudflare:email` `EmailMessage` class because that
+ *  module doesn't exist on bigrandall's workerd; a plain literal
+ *  with the same three properties satisfies the binding. */
 async function sendMimeMail (env, { subject, text, attachment }) {
   const from = env.EMAIL_FROM
   const to = env.EMAIL_TO
@@ -303,8 +313,7 @@ async function sendMimeMail (env, { subject, text, attachment }) {
     ? buildMultipart({ from, to, subject, text, attachment })
     : buildPlain({ from, to, subject, text })
 
-  const message = new EmailMessage(from, to, raw)
-  await env.SEND_EMAIL.send(message)
+  await env.SEND_EMAIL.send({ from, to, raw })
 }
 
 function buildPlain ({ from, to, subject, text }) {

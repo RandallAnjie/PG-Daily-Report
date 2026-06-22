@@ -75,15 +75,27 @@ await build({
   target: 'es2022',
   outfile: 'dist/_worker.js',
   plugins: [nodeResolvePlugin],
-  // porsager/postgres reaches for a bare global `Buffer` (without
-  // an import), counting on Node's default `globalThis.Buffer`.
-  // bigrandall's workerd doesn't expose Buffer as a global even
-  // with `nodejs_compat`, so the first PG message-frame encode
-  // throws `Buffer is not defined`. Banner-import it from
-  // node:buffer so every code path in the bundle has `Buffer` in
-  // its outer scope.
+  // porsager/postgres reaches for two bare globals that Node
+  // provides automatically but bigrandall's workerd doesn't expose
+  // even under `nodejs_compat`:
+  //
+  //   Buffer  — used to encode every outgoing message frame.
+  //             Sourced from `node:buffer`, which IS in the
+  //             documented nodejs_compat surface.
+  //   process — only `process.env.<PG…>` for default connection
+  //             options when the caller doesn't pass them. We
+  //             always pass them in src/worker.js openPg(), so a
+  //             literal `{ env: {} }` stub satisfies the symbol
+  //             lookup without dragging in node:process (which is
+  //             absent on bigrandall).
+  //
+  // The banner sits at the very top of dist/_worker.js so it
+  // executes before postgres' module evaluation reads either name.
   banner: {
-    js: 'import { Buffer } from "node:buffer"; globalThis.Buffer = Buffer;'
+    js:
+      'import { Buffer } from "node:buffer"; ' +
+      'globalThis.Buffer = Buffer; ' +
+      'globalThis.process = globalThis.process || { env: {}, platform: "linux", versions: { node: "22.0.0" } };'
   },
   minify: false,
   sourcemap: false,

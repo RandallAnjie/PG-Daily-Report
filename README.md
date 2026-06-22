@@ -15,7 +15,8 @@ machinery is small enough to fork-and-tweak for any other
 Every UTC midnight (bigrandall's cron agent posts to
 `/__edge_cron` with the configured `0 0 * * *` expression):
 
-1. Open one PostgreSQL connection (via [`postgres`](https://github.com/porsager/postgres) over `cloudflare:sockets`).
+1. Open one PostgreSQL connection (`pg` over `cloudflare:sockets`
+   via `pg-cloudflare`).
 2. Run:
 
    ```sql
@@ -27,9 +28,11 @@ Every UTC midnight (bigrandall's cron agent posts to
 
 3. Serialize the rows as RFC 4180 CSV (UTF-8 + BOM so Excel
    double-click doesn't garble Chinese).
-4. Send to `EMAIL_TO` via the `SEND_EMAIL` binding with the CSV
-   attached as `daily-users-YYYY-MM-DD.csv` and a small plain-text
-   summary in the body.
+4. Send to `EMAIL_TO` via the `SEND_EMAIL` binding. The bigrandall
+   binding doesn't support attachments, so the CSV is **inlined**:
+   - plain-text part: summary + raw CSV
+   - HTML part: summary + a styled monospace `<pre>` block with
+     the CSV (renders nicely in Gmail / Outlook / Apple Mail)
 5. Drop the DB socket and return.
 
 On any failure (DB unreachable, query error, etc) it tries to send

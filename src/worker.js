@@ -61,17 +61,6 @@ export default {
       return runReport(env, ctx, { trigger: 'manual', expression: '' })
     }
 
-    if (url.pathname === '/admin/probe-email') {
-      // Diagnostic: try multiple SEND_EMAIL.send() signatures and
-      // report which (if any) didn't throw. Use this to figure out
-      // the binding's expected payload shape on bigrandall — the
-      // error message body usually names the field it's missing.
-      if (!isAdmin(request, env)) {
-        return new Response('unauthorized\n', { status: 401 })
-      }
-      return probeEmailShapes(env)
-    }
-
     if (url.pathname === '/admin/preview') {
       // Same DB + CSV path, but emits the CSV in the response body
       // instead of sending the email. Useful for debugging the
@@ -116,53 +105,6 @@ export default {
  * env var is empty / unset, BOTH paths fail closed — even an
  * empty `?token=` won't unlock anything.
  */
-/** Try several common SEND_EMAIL.send() argument shapes against
- *  the bigrandall binding, capturing which one didn't throw and
- *  what the rejection message was for the others. The point isn't
- *  to actually deliver a mail (DKIM gates that anyway in dev) —
- *  it's to figure out which payload shape the binding parser
- *  expects so the real call site can stop iterating on deploys. */
-async function probeEmailShapes (env) {
-  const from = env.EMAIL_FROM || 'probe@example.com'
-  const to = env.EMAIL_TO || 'probe@example.com'
-  const subject = 'probe'
-  const text = 'probe body'
-  // Tiny base64 of "hi\n" for attachment shape probing.
-  const b64 = 'aGkK'
-  const shapes = [
-    // Sanity — known-good
-    ['{from,to,subject,text} sanity', () => env.SEND_EMAIL.send({ from, to, subject, text })],
-    // Attachment shape variants
-    ['attachments:[{filename,contentType,content}]', () => env.SEND_EMAIL.send({ from, to, subject, text, attachments: [{ filename: 'a.txt', contentType: 'text/plain', content: b64 }] })],
-    ['attachments:[{filename,content_type,content}]', () => env.SEND_EMAIL.send({ from, to, subject, text, attachments: [{ filename: 'a.txt', content_type: 'text/plain', content: b64 }] })],
-    ['attachments:[{filename,contentType,data}]', () => env.SEND_EMAIL.send({ from, to, subject, text, attachments: [{ filename: 'a.txt', contentType: 'text/plain', data: b64 }] })],
-    ['attachments:[{name,type,content}] Resend-style', () => env.SEND_EMAIL.send({ from, to, subject, text, attachments: [{ name: 'a.txt', type: 'text/plain', content: b64 }] })],
-    ['attachments:[{filename,type,content}]', () => env.SEND_EMAIL.send({ from, to, subject, text, attachments: [{ filename: 'a.txt', type: 'text/plain', content: b64 }] })],
-    ['attachments:[{filename,content}]', () => env.SEND_EMAIL.send({ from, to, subject, text, attachments: [{ filename: 'a.txt', content: b64 }] })],
-    // Top-level rather than nested
-    ['attachment singular {filename,content}', () => env.SEND_EMAIL.send({ from, to, subject, text, attachment: { filename: 'a.txt', content: b64 } })],
-    // Files array variant
-    ['files:[{filename,content}]', () => env.SEND_EMAIL.send({ from, to, subject, text, files: [{ filename: 'a.txt', content: b64 }] })],
-    // Plain-text content (not base64)
-    ['attachments:[{filename,contentType,content=plain}]', () => env.SEND_EMAIL.send({ from, to, subject, text, attachments: [{ filename: 'a.txt', contentType: 'text/plain', content: 'hi\n' }] })],
-    // Reply-to + cc shape probe
-    ['everything-and-the-kitchen-sink', () => env.SEND_EMAIL.send({ from, to, subject, text, html: '<p>' + text + '</p>', reply_to: from, replyTo: from })]
-  ]
-  const results = []
-  for (const [label, fn] of shapes) {
-    try {
-      await fn()
-      results.push({ shape: label, ok: true })
-    } catch (e) {
-      results.push({ shape: label, ok: false, error: String(e?.message || e).slice(0, 200) })
-    }
-  }
-  return new Response(JSON.stringify({ results }, null, 2), {
-    status: 200,
-    headers: { 'content-type': 'application/json; charset=utf-8' }
-  })
-}
-
 function isAdmin (request, env) {
   const expected = env.ADMIN_TOKEN || ''
   if (!expected) return false
@@ -398,31 +340,53 @@ function reportDateString () {
   return new Date().toISOString().slice(0, 10)
 }
 
-/** Send the success email with the CSV as an attachment. */
+/** Send the success email. The bigrandall send_email binding
+ *  doesn't accept attachments — its documented signature is just
+ *  `{to, subject, text, html, from?, replyTo?, cc?, bcc?}`. We
+ *  inline the whole CSV into both the plain-text and HTML parts
+ *  instead. Email clients render the HTML `<pre>` block as a
+ *  monospace, scrollable code box that reads well at a few-
+ *  hundred-row report size; the plain-text fallback ships the
+ *  raw CSV after a summary header so power users / scripts can
+ *  pipe the body straight into a file. */
 async function sendReportMail (env, report) {
   const date = reportDateString()
   const subject = `[PG-Daily-Report] ${date} — ${report.rowCount} new user${report.rowCount === 1 ? '' : 's'}`
-  const filename = `daily-users-${date}.csv`
-  const body =
-    `New-user report for the past 24 h (UTC).\n` +
-    `\n` +
+
+  const summary =
     `Date    : ${date}\n` +
     `Rows    : ${report.rowCount}\n` +
     `Columns : ${report.columns.length}\n` +
-    `Query   : ${report.durationMs} ms\n` +
+    `Query   : ${report.durationMs} ms`
+
+  const text =
+    `New-user report for the past 24 h (UTC).\n` +
     `\n` +
-    `See attached CSV (UTF-8 with BOM, RFC 4180 quoting).\n`
-  await sendStructuredMail(env, {
-    subject,
-    text: body,
-    attachments: [
-      {
-        filename,
-        contentType: 'text/csv; charset=utf-8',
-        contentBase64: base64Encode(report.csv)
-      }
-    ]
-  })
+    summary +
+    `\n` +
+    `\n` +
+    `--- CSV (UTF-8 with BOM, RFC 4180) ---\n` +
+    `\n` +
+    report.csv
+
+  const html = `<!doctype html>
+<html lang="en">
+<body style="margin:0;padding:24px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1f2328;">
+  <h2 style="margin:0 0 12px;font-weight:600;">PG Daily Report — ${escapeHtml(date)}</h2>
+  <p style="margin:0 0 16px;color:#57606a;">New-user report for the past 24 h (UTC).</p>
+  <table style="border-collapse:collapse;margin-bottom:20px;font-size:14px;">
+    <tbody>
+      <tr><td style="padding:2px 16px 2px 0;color:#57606a;">Rows</td><td style="padding:2px 0;font-weight:600;">${report.rowCount}</td></tr>
+      <tr><td style="padding:2px 16px 2px 0;color:#57606a;">Columns</td><td style="padding:2px 0;">${report.columns.length}</td></tr>
+      <tr><td style="padding:2px 16px 2px 0;color:#57606a;">Query</td><td style="padding:2px 0;">${report.durationMs} ms</td></tr>
+    </tbody>
+  </table>
+  <p style="margin:0 0 8px;color:#57606a;font-size:13px;">CSV (UTF-8 + BOM, RFC 4180 quoting):</p>
+  <pre style="margin:0;padding:14px 16px;font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;font-size:12px;line-height:1.5;background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;white-space:pre;overflow-x:auto;">${escapeHtml(report.csv)}</pre>
+</body>
+</html>`
+
+  await sendStructuredMail(env, { subject, text, html })
 }
 
 /** Send a brief failure notice when the report build blew up. */
@@ -439,27 +403,33 @@ async function sendFailureMail (env, errorMessage) {
 }
 
 /** Hand a structured email payload to the bigrandall outbound
- *  mail binding (`SEND_EMAIL`). The binding accepts a Resend /
- *  Mailgun-style object — top-level `subject`, `text`, `html`
- *  fields and an `attachments[]` array — and assembles the
- *  RFC 5322 frame itself. This is NOT Cloudflare's Email Workers
- *  raw-RFC-822 shape (an earlier draft tried `{from,to,raw}` and
- *  got "send(): missing subject" back).
+ *  mail binding (`SEND_EMAIL`). The binding's documented signature
+ *  (per `internal/workerd/manager.go::emailSenderShimSource`):
  *
- *  Attachment object shape we send:
- *    { filename, contentType, contentBase64 }
- *  Common alternatives across mail-API providers:
- *    { filename, type, content }              (Resend)
- *    { filename, content, contentType }       (Mailgun-ish)
- *    { filename, content_type, data }         (snake_case)
- *  We pass `filename` + `contentType` + both `content` and
- *  `contentBase64` so whichever shape the binding parses against,
- *  it'll find what it's looking for. */
-async function sendStructuredMail (env, { subject, text, html, attachments }) {
+ *    env.SEND_EMAIL.send({
+ *      to:       string | string[],   // required
+ *      subject:  string,              // required
+ *      text:     string,              // text OR html required
+ *      html:     string,              // ...
+ *      from:     string,              // optional, defaults to bound domain
+ *      replyTo:  string,              // optional
+ *      cc:       string[],            // optional
+ *      bcc:      string[],            // optional
+ *    })
+ *
+ *  No attachments[] field — earlier iterations tried it but the
+ *  binding silently dropped the data. */
+async function sendStructuredMail (env, { subject, text, html, replyTo, cc, bcc }) {
   const from = env.EMAIL_FROM
   const to = env.EMAIL_TO
-  if (!from || !to) {
-    throw new Error('EMAIL_FROM / EMAIL_TO env vars not set')
+  if (!to) {
+    throw new Error('EMAIL_TO env var not set')
+  }
+  if (!subject) {
+    throw new Error('subject not set')
+  }
+  if (!text && !html) {
+    throw new Error('text or html body required')
   }
   if (!env.SEND_EMAIL) {
     throw new Error('SEND_EMAIL binding not bound — see RANDALLFLARE.md')
@@ -472,45 +442,32 @@ async function sendStructuredMail (env, { subject, text, html, attachments }) {
   // throw at call time if it doesn't.
 
   const payload = {
-    from,
     to,
     subject,
-    text: text || '',
+    ...(text ? { text } : {}),
     ...(html ? { html } : {}),
-    ...(attachments && attachments.length
-      ? {
-          attachments: attachments.map((a) => ({
-            filename: a.filename,
-            contentType: a.contentType,
-            // Belt-and-braces field aliases — bigrandall's binding
-            // may key on any of these.
-            content: a.contentBase64,
-            content_type: a.contentType,
-            data: a.contentBase64
-          }))
-        }
-      : {})
+    ...(from ? { from } : {}),
+    ...(replyTo ? { replyTo } : {}),
+    ...(cc ? { cc } : {}),
+    ...(bcc ? { bcc } : {})
   }
 
   log('info', 'mail:send', {
-    to, from, subject,
+    to, from: from || '(default-bound-domain)', subject,
     textBytes: text?.length || 0,
-    attachments: attachments?.length || 0,
-    firstAttachmentB64Bytes: attachments?.[0]?.contentBase64?.length || 0
+    htmlBytes: html?.length || 0
   })
   await env.SEND_EMAIL.send(payload)
 }
 
-/** Encode UTF-8 string to base64. workerd has btoa() but it only
- *  accepts Latin-1 bytes — round-trip via TextEncoder first. */
-function base64Encode (utf8Str) {
-  const bytes = new TextEncoder().encode(utf8Str)
-  let bin = ''
-  // Chunk the conversion so we don't blow the stack on a multi-MB
-  // CSV (apply() arg-count limits are ~64k frames on some engines).
-  const CHUNK = 0x8000
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK))
-  }
-  return btoa(bin)
+/** Escape `&`, `<`, `>`, `"`, `'` so a CSV cell with a stray `<`
+ *  or `&` doesn't poison the surrounding HTML structure. */
+function escapeHtml (s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  })[c])
 }

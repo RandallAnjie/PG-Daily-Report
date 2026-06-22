@@ -34,14 +34,36 @@ Console → *Workers* → new worker → connect GitHub repo
 ## `SEND_EMAIL` binding
 
 Worker control panel → *Bindings* → add a new binding of type
-*Email* / *send_email*, name **`SEND_EMAIL`**, point at the
-destination you want the daily mail to land in. The worker calls
-`env.SEND_EMAIL.send(new EmailMessage(from, to, raw))` — the
-binding handles relay, SPF / DKIM, etc.
+*Email* / *send_email*, name **`SEND_EMAIL`**, with the sender
+domain whose DKIM + SPF are green. The worker calls
+
+```js
+env.SEND_EMAIL.send({
+  to:       string | string[],   // required (uses EMAIL_TO env)
+  subject:  string,              // required
+  text:     string,              // text OR html required
+  html:     string,              // ...
+  from:     string,              // optional, defaults to bound domain (uses EMAIL_FROM env when set)
+  replyTo:  string,
+  cc:       string[],
+  bcc:      string[],
+})
+```
+
+— per the canonical signature in
+`internal/workerd/manager.go::emailSenderShimSource` on the
+bigrandall edge agent. The binding handles MIME assembly, relay,
+SPF / DKIM, retries.
+
+> **No attachments.** The binding signature does NOT include an
+> `attachments` field. (Earlier versions of this worker tried to
+> pass one — the call returned ok but the data was dropped on
+> the platform side.) The CSV is inlined into both the plain-text
+> and HTML body parts instead.
 
 If your bigrandall deploy doesn't ship `send_email` (older
 versions don't), swap in a Resend / Mailgun fetch-based send.
-Roughly: replace `sendMimeMail()`'s `env.SEND_EMAIL.send(...)`
+Roughly: replace `sendStructuredMail()`'s `env.SEND_EMAIL.send(...)`
 with `fetch('https://api.resend.com/emails', { ... })` and add a
 `RESEND_API_KEY` env var.
 

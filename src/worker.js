@@ -127,17 +127,26 @@ async function probeEmailShapes (env) {
   const to = env.EMAIL_TO || 'probe@example.com'
   const subject = 'probe'
   const text = 'probe body'
+  // Tiny base64 of "hi\n" for attachment shape probing.
+  const b64 = 'aGkK'
   const shapes = [
-    ['{from,to,subject,text}', () => env.SEND_EMAIL.send({ from, to, subject, text })],
-    ['{from,to,subject,body}', () => env.SEND_EMAIL.send({ from, to, subject, body: text })],
-    ['{from,to,subject,html}', () => env.SEND_EMAIL.send({ from, to, subject, html: '<p>' + text + '</p>' })],
-    ['(from,to,subject,text) positional', () => env.SEND_EMAIL.send(from, to, subject, text)],
-    ['(to,subject,text) positional 3', () => env.SEND_EMAIL.send(to, subject, text)],
-    ['{message:{from,to,subject,text}}', () => env.SEND_EMAIL.send({ message: { from, to, subject, text } })],
-    ['{mail:{from,to,subject,text}}', () => env.SEND_EMAIL.send({ mail: { from, to, subject, text } })],
-    ['{to,from,subject,text} (to first)', () => env.SEND_EMAIL.send({ to, from, subject, text })],
-    ['{from,to,subject,raw} text-as-raw', () => env.SEND_EMAIL.send({ from, to, subject, raw: text })],
-    ['{from,to,raw} pure RFC822', () => env.SEND_EMAIL.send({ from, to, raw: 'From: ' + from + '\r\nTo: ' + to + '\r\nSubject: ' + subject + '\r\n\r\n' + text })]
+    // Sanity — known-good
+    ['{from,to,subject,text} sanity', () => env.SEND_EMAIL.send({ from, to, subject, text })],
+    // Attachment shape variants
+    ['attachments:[{filename,contentType,content}]', () => env.SEND_EMAIL.send({ from, to, subject, text, attachments: [{ filename: 'a.txt', contentType: 'text/plain', content: b64 }] })],
+    ['attachments:[{filename,content_type,content}]', () => env.SEND_EMAIL.send({ from, to, subject, text, attachments: [{ filename: 'a.txt', content_type: 'text/plain', content: b64 }] })],
+    ['attachments:[{filename,contentType,data}]', () => env.SEND_EMAIL.send({ from, to, subject, text, attachments: [{ filename: 'a.txt', contentType: 'text/plain', data: b64 }] })],
+    ['attachments:[{name,type,content}] Resend-style', () => env.SEND_EMAIL.send({ from, to, subject, text, attachments: [{ name: 'a.txt', type: 'text/plain', content: b64 }] })],
+    ['attachments:[{filename,type,content}]', () => env.SEND_EMAIL.send({ from, to, subject, text, attachments: [{ filename: 'a.txt', type: 'text/plain', content: b64 }] })],
+    ['attachments:[{filename,content}]', () => env.SEND_EMAIL.send({ from, to, subject, text, attachments: [{ filename: 'a.txt', content: b64 }] })],
+    // Top-level rather than nested
+    ['attachment singular {filename,content}', () => env.SEND_EMAIL.send({ from, to, subject, text, attachment: { filename: 'a.txt', content: b64 } })],
+    // Files array variant
+    ['files:[{filename,content}]', () => env.SEND_EMAIL.send({ from, to, subject, text, files: [{ filename: 'a.txt', content: b64 }] })],
+    // Plain-text content (not base64)
+    ['attachments:[{filename,contentType,content=plain}]', () => env.SEND_EMAIL.send({ from, to, subject, text, attachments: [{ filename: 'a.txt', contentType: 'text/plain', content: 'hi\n' }] })],
+    // Reply-to + cc shape probe
+    ['everything-and-the-kitchen-sink', () => env.SEND_EMAIL.send({ from, to, subject, text, html: '<p>' + text + '</p>', reply_to: from, replyTo: from })]
   ]
   const results = []
   for (const [label, fn] of shapes) {

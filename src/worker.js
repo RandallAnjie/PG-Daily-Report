@@ -354,21 +354,23 @@ async function sendReportMail (env, report) {
     `Query   : ${report.durationMs} ms\n` +
     `\n` +
     `See attached CSV (UTF-8 with BOM, RFC 4180 quoting).\n`
-  await sendMimeMail(env, {
+  await sendStructuredMail(env, {
     subject,
     text: body,
-    attachment: {
-      filename,
-      contentType: 'text/csv; charset="utf-8"',
-      bodyUtf8: report.csv
-    }
+    attachments: [
+      {
+        filename,
+        contentType: 'text/csv; charset=utf-8',
+        contentBase64: base64Encode(report.csv)
+      }
+    ]
   })
 }
 
 /** Send a brief failure notice when the report build blew up. */
 async function sendFailureMail (env, errorMessage) {
   const date = reportDateString()
-  await sendMimeMail(env, {
+  await sendStructuredMail(env, {
     subject: `[PG-Daily-Report] ${date} — FAILED`,
     text:
       `Daily report build failed.\n\n` +
@@ -378,15 +380,24 @@ async function sendFailureMail (env, errorMessage) {
   })
 }
 
-/** Build an RFC-5322 / 5321 raw email (multipart/mixed when an
- *  attachment is present, plain text otherwise) and hand it to the
- *  bigrandall outbound mail binding (`SEND_EMAIL`). The binding's
- *  invocation shape mirrors Cloudflare's Email Workers — pass an
- *  object carrying `from`, `to`, and `raw` (the RFC-822 text). We
- *  skip the `cloudflare:email` `EmailMessage` class because that
- *  module doesn't exist on bigrandall's workerd; a plain literal
- *  with the same three properties satisfies the binding. */
-async function sendMimeMail (env, { subject, text, attachment }) {
+/** Hand a structured email payload to the bigrandall outbound
+ *  mail binding (`SEND_EMAIL`). The binding accepts a Resend /
+ *  Mailgun-style object — top-level `subject`, `text`, `html`
+ *  fields and an `attachments[]` array — and assembles the
+ *  RFC 5322 frame itself. This is NOT Cloudflare's Email Workers
+ *  raw-RFC-822 shape (an earlier draft tried `{from,to,raw}` and
+ *  got "send(): missing subject" back).
+ *
+ *  Attachment object shape we send:
+ *    { filename, contentType, contentBase64 }
+ *  Common alternatives across mail-API providers:
+ *    { filename, type, content }              (Resend)
+ *    { filename, content, contentType }       (Mailgun-ish)
+ *    { filename, content_type, data }         (snake_case)
+ *  We pass `filename` + `contentType` + both `content` and
+ *  `contentBase64` so whichever shape the binding parses against,
+ *  it'll find what it's looking for. */
+async function sendStructuredMail (env, { subject, text, html, attachments }) {
   const from = env.EMAIL_FROM
   const to = env.EMAIL_TO
   if (!from || !to) {
@@ -400,60 +411,36 @@ async function sendMimeMail (env, { subject, text, attachment }) {
   // any property access on them (even a typeof check) triggers a
   // platform warning about "__es_marker__ might appear to be an
   // RPC method". So we trust the binding exists and let .send()
-  // throw at call time if it doesn't — caught by runReport() above.
+  // throw at call time if it doesn't.
 
-  const raw = attachment
-    ? buildMultipart({ from, to, subject, text, attachment })
-    : buildPlain({ from, to, subject, text })
+  const payload = {
+    from,
+    to,
+    subject,
+    text: text || '',
+    ...(html ? { html } : {}),
+    ...(attachments && attachments.length
+      ? {
+          attachments: attachments.map((a) => ({
+            filename: a.filename,
+            contentType: a.contentType,
+            // Belt-and-braces field aliases — bigrandall's binding
+            // may key on any of these.
+            content: a.contentBase64,
+            content_type: a.contentType,
+            data: a.contentBase64
+          }))
+        }
+      : {})
+  }
 
   log('info', 'mail:send', {
-    to, from, subject, rawBytes: raw.length,
-    hasAttachment: !!attachment
+    to, from, subject,
+    textBytes: text?.length || 0,
+    attachments: attachments?.length || 0,
+    firstAttachmentB64Bytes: attachments?.[0]?.contentBase64?.length || 0
   })
-  await env.SEND_EMAIL.send({ from, to, raw })
-}
-
-function buildPlain ({ from, to, subject, text }) {
-  return [
-    `From: ${from}`,
-    `To: ${to}`,
-    `Subject: ${encodeMimeHeader(subject)}`,
-    'MIME-Version: 1.0',
-    'Content-Type: text/plain; charset="utf-8"',
-    'Content-Transfer-Encoding: 8bit',
-    '',
-    text
-  ].join('\r\n')
-}
-
-function buildMultipart ({ from, to, subject, text, attachment }) {
-  const boundary = `----pgreport-${crypto.randomUUID().replace(/-/g, '')}`
-  const attachmentB64 = base64Encode(attachment.bodyUtf8)
-  // Fold base64 to 76-char lines per RFC 2045 §6.8 — some mail
-  // servers reject a single multi-megabyte line outright.
-  const folded = attachmentB64.match(/.{1,76}/g)?.join('\r\n') ?? ''
-  return [
-    `From: ${from}`,
-    `To: ${to}`,
-    `Subject: ${encodeMimeHeader(subject)}`,
-    'MIME-Version: 1.0',
-    `Content-Type: multipart/mixed; boundary="${boundary}"`,
-    '',
-    'This is a multi-part message in MIME format.',
-    `--${boundary}`,
-    'Content-Type: text/plain; charset="utf-8"',
-    'Content-Transfer-Encoding: 8bit',
-    '',
-    text,
-    `--${boundary}`,
-    `Content-Type: ${attachment.contentType}`,
-    'Content-Transfer-Encoding: base64',
-    `Content-Disposition: attachment; filename="${attachment.filename}"`,
-    '',
-    folded,
-    `--${boundary}--`,
-    ''
-  ].join('\r\n')
+  await env.SEND_EMAIL.send(payload)
 }
 
 /** Encode UTF-8 string to base64. workerd has btoa() but it only
@@ -468,14 +455,4 @@ function base64Encode (utf8Str) {
     bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK))
   }
   return btoa(bin)
-}
-
-/** Encode a subject (or any header) into RFC 2047 Q-encoded form
- *  when it carries non-ASCII characters, so the receiving MUA
- *  renders 中文 / emoji correctly instead of as `=?...?=` literal. */
-function encodeMimeHeader (s) {
-  // eslint-disable-next-line no-control-regex
-  if (/^[\x00-\x7F]*$/.test(s)) return s
-  const b64 = base64Encode(s)
-  return `=?utf-8?B?${b64}?=`
 }

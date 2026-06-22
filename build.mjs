@@ -100,27 +100,52 @@ await build({
   target: 'es2022',
   outfile: 'dist/_worker.js',
   plugins: [nodeResolvePlugin],
-  // porsager/postgres reaches for two bare globals that Node
-  // provides automatically but bigrandall's workerd doesn't expose
-  // even under `nodejs_compat`:
+  // The bundle is ESM but pg (node-postgres) is a pure-CommonJS
+  // package. esbuild faithfully reproduces every `require('node:
+  // X')` it finds inside pg as a call to its own `__require`
+  // helper — which, on workerd, throws "Dynamic require of …
+  // is not supported" because workerd ESM has no runtime
+  // `require`. We sidestep that by:
   //
-  //   Buffer  — used to encode every outgoing message frame.
-  //             Sourced from `node:buffer`, which IS in the
-  //             documented nodejs_compat surface.
-  //   process — only `process.env.<PG…>` for default connection
-  //             options when the caller doesn't pass them. We
-  //             always pass them in src/worker.js openPg(), so a
-  //             literal `{ env: {} }` stub satisfies the symbol
-  //             lookup without dragging in node:process (which is
-  //             absent on bigrandall).
-  //
-  // The banner sits at the very top of dist/_worker.js so it
-  // executes before postgres' module evaluation reads either name.
+  //   1. Statically importing every node-builtin module our deps
+  //      actually use (the externals seen with
+  //      `grep require dist/_worker.js`), so they're available at
+  //      module load time without a dynamic require.
+  //   2. Installing a `globalThis.require` shim that looks up the
+  //      requested name in a pre-built table. esbuild's __require
+  //      helper detects this via `typeof require !== "undefined"`
+  //      and routes its calls through our shim.
+  //   3. Also installing Buffer + process on globalThis since pg
+  //      relies on Node's automatic globals for both.
   banner: {
     js:
-      'import { Buffer } from "node:buffer"; ' +
-      'globalThis.Buffer = Buffer; ' +
-      'globalThis.process = globalThis.process || { env: {}, platform: "linux", versions: { node: "22.0.0" } };'
+      'import * as __M_buffer from "node:buffer";' +
+      'import * as __M_crypto from "node:crypto";' +
+      'import * as __M_dns from "node:dns";' +
+      'import * as __M_events from "node:events";' +
+      'import * as __M_net from "node:net";' +
+      'import * as __M_stream from "node:stream";' +
+      'import * as __M_tls from "node:tls";' +
+      'import * as __M_util from "node:util";' +
+      'const __NODE_MODS = {' +
+        '"node:buffer": __M_buffer.default ?? __M_buffer,' +
+        '"node:crypto": __M_crypto.default ?? __M_crypto,' +
+        '"node:dns":    __M_dns.default    ?? __M_dns,' +
+        '"node:events": __M_events.default ?? __M_events,' +
+        '"node:net":    __M_net.default    ?? __M_net,' +
+        '"node:stream": __M_stream.default ?? __M_stream,' +
+        '"node:tls":    __M_tls.default    ?? __M_tls,' +
+        '"node:util":   __M_util.default   ?? __M_util,' +
+      '};' +
+      'for (const k of Object.keys(__NODE_MODS)) ' +
+        '__NODE_MODS[k.replace("node:","")] = __NODE_MODS[k];' +
+      'globalThis.Buffer = __M_buffer.Buffer;' +
+      'globalThis.process = globalThis.process || ' +
+        '{ env: {}, platform: "linux", versions: { node: "22.0.0" } };' +
+      'globalThis.require = (m) => {' +
+        'if (__NODE_MODS[m]) return __NODE_MODS[m];' +
+        'throw new Error("Dynamic require of \\""+m+"\\" not in node-mod table");' +
+      '};'
   },
   minify: false,
   sourcemap: false,
